@@ -1,0 +1,15 @@
+name: pprd
+channels:
+  - pytorch
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pytorch
+  - torchvision
+  - pip:
+      - pytorch-lightning>=2.2.0
+      - wandb>=0.17.0
+      - python-dotenv>=1.0.1
+      - tensorboard>=2.16.0
+      - numpy>=1.26.0

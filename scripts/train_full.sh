@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+python train.py \
+  --epochs 5 \
+  --linear-epochs 5 \
+  --batch-size 128 \
+  --replay-size 1000 \
+  --device auto \
+  --enable-csv \
+  --enable-tb \
+  --use-wandb \
+  --wandb-project pprd \
+  --wandb-tags split-cifar10,full

@@ -1,0 +1,32 @@
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Local secrets
+.env
+
+# Training outputs
+logs/
+wandb/
+lightning_logs/
+checkpoints/
+*.pth
+
+# Data archives
+datasets/*
+
+# Notebook and editor
+.ipynb_checkpoints/
+.vscode/
