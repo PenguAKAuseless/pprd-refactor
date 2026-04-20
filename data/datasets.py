@@ -109,6 +109,7 @@ class SplitCIFAR10Manager:
         tasks: int = 5,
         classes_per_task: int = 2,
         seed: int = 0,
+        task_order: Optional[List[int]] = None,
     ) -> None:
         self.root = root
         self.batch_size = batch_size
@@ -116,6 +117,7 @@ class SplitCIFAR10Manager:
         self.tasks = tasks
         self.classes_per_task = classes_per_task
         self.seed = seed
+        self.task_order = self._normalize_task_order(task_order)
         self.pin_memory = torch.cuda.is_available()
 
         self.train_transform = transforms.Compose(
@@ -142,6 +144,23 @@ class SplitCIFAR10Manager:
         self.test_indices_by_task = self._collect_task_indices(self.test_dataset)
 
         self.replay_buffer = ReplayBuffer(max_size=replay_size, seed=seed)
+
+    def _normalize_task_order(self, task_order: Optional[List[int]]) -> List[int]:
+        if task_order is None:
+            return list(range(self.tasks))
+
+        if len(task_order) != self.tasks:
+            raise ValueError(
+                f"task_order must contain exactly {self.tasks} entries, got {len(task_order)}"
+            )
+
+        normalized = [int(v) for v in task_order]
+        expected = set(range(self.tasks))
+        if set(normalized) != expected:
+            raise ValueError(
+                f"task_order must be a permutation of {sorted(expected)}, got {normalized}"
+            )
+        return normalized
 
     def _build_train_dataset(self, augment: bool) -> Dataset:
         transform = self.train_transform if augment else self.test_transform
@@ -186,10 +205,11 @@ class SplitCIFAR10Manager:
         return labels
 
     def _build_task_classes(self) -> List[List[int]]:
-        return [
+        base = [
             list(range(t * self.classes_per_task, (t + 1) * self.classes_per_task))
             for t in range(self.tasks)
         ]
+        return [base[idx] for idx in self.task_order]
 
     def _collect_task_indices(self, dataset: Dataset) -> List[List[int]]:
         targets = self._dataset_targets(dataset)
@@ -249,6 +269,18 @@ class SplitCIFAR10Manager:
         return DataLoader(
             subset,
             batch_size=batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            persistent_workers=self.num_workers > 0,
+        )
+
+    def get_task_test_loader(self, task_id: int, batch_size: Optional[int] = None) -> DataLoader:
+        subset = self._task_subset(self.test_dataset, task_id)
+        effective_batch_size = batch_size if batch_size is not None else self.batch_size
+        return DataLoader(
+            subset,
+            batch_size=effective_batch_size,
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,

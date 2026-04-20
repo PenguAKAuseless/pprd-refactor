@@ -1,61 +1,65 @@
-# PPRD: Patch-based Continual Learning with Contrastive Distillation
+# PPRD: Patch-Based Continual Learning with Contrastive Distillation
 
-This repository contains a PyTorch + PyTorch Lightning implementation for continual learning on Split CIFAR-10 with:
+This repository provides a Split CIFAR-10 continual learning pipeline based on patch-level representations, replay, and PRD distillation.
+
+Core features:
 
 - Tensor-only 2x2 patch extraction and bilinear upsampling
-- ResNet18 backbone + MLP projection head
-- ISSupConLoss for contrastive training
-- PRD logits distillation from frozen old model
-- Multi-backend runtime support: CUDA (Windows/Linux), MPS (macOS), CPU fallback
-- Unified experiment logging: Lightning loggers + LitLogger + optional W&B
+- ResNet18 encoder + MLP projection head
+- ISSupConLoss for contrastive supervision
+- PRD logit distillation from the frozen previous model
+- Patch prototype modes: class_mean_ema, class_confidence_ema, class_position_ema
+- Unified backbone modes: patch and roi_patch
+- Structured artifacts for downstream analysis, including stage diagnostics
 
 ## 1) Repository Layout
 
-- `train.py`: Main entrypoint for continual training and linear evaluation
-- `models/`: Model definitions (`patch_backbone.py`)
-- `data/`: Dataset and replay management (`datasets.py`)
-- `utils/`: Losses and logging utilities (`losses.py`, `litlogger.py`)
-- `configs/`: Reproducible command templates and baseline configurations
-- `scripts/`: Cross-platform run helpers
-- `docs/`: Experiment, logging, and reproducibility docs
+- train.py: main entrypoint for continual training and eval-only checkpoint analysis
+- data/: split manager and replay buffer logic
+- models/: patch/roi_patch backbone implementation
+- utils/: losses, logging, and evaluation diagnostics utilities
+- lab/: comparison runners and analysis notebook
+- tests/: unit tests for diagnostics and replay behavior
+- logs/: experiment outputs (generated)
 
 ## 2) Environment Setup
 
-### Option A: pip (recommended)
+Option A (pip):
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate  # macOS/Linux
+source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-Windows (PowerShell):
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install --upgrade pip
-pip install -r requirements.txt
-```
-
-### Option B: Conda
+Option B (conda):
 
 ```bash
 conda env create -f environment.yml
 conda activate pprd
 ```
 
-## 3) W&B Setup
+## 3) Dev Tooling
 
-1. Copy `.env.example` to `.env`
-2. Fill `WANDB_API_KEY`, `WANDB_ENTITY`, and optional project defaults
-3. Run with `--use-wandb`
-
-Example:
+Install development tools:
 
 ```bash
-python train.py --use-wandb --wandb-project pprd --wandb-tags split-cifar10,baseline
+pip install -r requirements-dev.txt
+```
+
+Run checks:
+
+```bash
+ruff check train.py data models utils lab tests
+ruff format --check train.py data models utils lab tests
+pytest
+```
+
+Enable pre-commit hooks:
+
+```bash
+pre-commit install
 ```
 
 ## 4) Quick Start
@@ -63,38 +67,60 @@ python train.py --use-wandb --wandb-project pprd --wandb-tags split-cifar10,base
 Smoke test:
 
 ```bash
-python train.py --epochs 1 --linear-epochs 1 --batch-size 64 --num-workers 0 --max-train-batches 1 --max-eval-batches 1 --device auto --enable-csv --enable-tb
+python train.py --epochs 1 --linear-epochs 1 --batch-size 64 --num-workers 0 --max-train-batches 1 --max-eval-batches 1 --device auto --enable-csv
 ```
 
-Full run:
+Backbone comparison:
 
 ```bash
-python train.py --epochs 5 --linear-epochs 5 --batch-size 128 --replay-size 1000 --device auto --enable-csv --enable-tb --use-wandb
+python lab/run_backbone_comparison.py --backbones patch roi_patch --epochs 2 --linear-epochs 2 --batch-size 128 --replay-size 1000 --device auto
+```
+
+Patch prototype comparison:
+
+```bash
+python lab/run_patch_prototype_comparison.py --backbone patch --epochs 3 --linear-epochs 3
 ```
 
 ## 5) Device Backends
 
-- `--device auto`: CUDA > MPS > CPU
-- `--device cuda`: strict CUDA check
-- `--device mps`: strict Apple Metal check
-- `--device cpu`: force CPU
+- --device auto: CUDA > MPS > CPU
+- --device cuda: strict CUDA check
+- --device mps: strict Apple Metal check
+- --device cpu: force CPU
 
-Examples:
-
-```bash
-python train.py --device mps
-python train.py --device cuda
-```
-
-## 6) Logging Outputs
+## 6) Run Artifacts
 
 Each run directory contains:
 
-- `training.log`: human-readable run timeline
-- `events.jsonl`: structured event log from LitLogger
-- `metrics.csv`: task-level metrics from LitLogger
-- `csv_logs/`: Lightning CSV logger outputs (if enabled)
-- `tb_logs/`: TensorBoard logs (if enabled)
-- `results.json`: per-task summary
+- training.log: human-readable training timeline
+- events.jsonl: structured events from LitLogger
+- metrics.csv: scalar metrics from LitLogger
+- results_tasks.json: per-stage linear-eval metrics over seen tasks
+- results_step_eval.json: step-level raw-logit evaluation snapshots
+- results_summary.json: final aggregate summary
+- results_diagnostics.json: stage-level confusion diagnostics and failure flags
+- results.json: combined artifact for compatibility
 
-See `docs/LOGGING.md` for details.
+Important note:
+
+- results_step_eval.json and results_tasks.json are different measurement modes.
+- Step-eval uses raw model logits during training.
+- Stage summary uses linear-probe evaluation on frozen features.
+
+## 7) Notebook Analysis
+
+Use lab/backbone_comparison.ipynb to:
+
+- compare final per-task performance
+- inspect all-task behavior across training stages (heatmap + trajectories)
+- deep-dive near-chance failures using confusion diagnostics
+
+If diagnostics are missing in existing runs, rerun the training/comparison scripts after updating train.py.
+
+## 8) CI
+
+GitHub Actions workflow is defined in .github/workflows/ci.yml and runs:
+
+- Ruff lint/format checks
+- Pytest suite
