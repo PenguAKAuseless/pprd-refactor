@@ -289,8 +289,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prototype-momentum", type=float, default=0.9)
 
     parser.add_argument("--nce-temp", type=float, default=0.07)
-    parser.add_argument("--current-temp", type=float, default=0.10)
-    parser.add_argument("--past-temp", type=float, default=0.04)
+    parser.add_argument("--current-temp", type=float, default=1.0)
+    parser.add_argument("--past-temp", type=float, default=2.0)
     parser.add_argument("--lambda-patch-ce", type=float, default=1.0)
     parser.add_argument("--lambda-prd", type=float, default=1.0)
 
@@ -299,7 +299,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--roi-prob", type=float, default=1.0)
 
     parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--linear-epochs", type=int, default=3)
+    parser.add_argument("--linear-epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--replay-size", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=42)

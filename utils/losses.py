@@ -138,7 +138,7 @@ def prd_loss(
     logits_cur: torch.Tensor,
     logits_old: torch.Tensor,
     current_temp: float = 1.0,
-    past_temp: float = 1.0,
+    past_temp: float = 2.0,
 ) -> torch.Tensor:
     """Predictive representation distillation on classifier logits."""
     log_p_cur = F.log_softmax(logits_cur / current_temp, dim=-1)

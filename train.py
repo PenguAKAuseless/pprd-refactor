@@ -595,14 +595,15 @@ def train_linear_eval(
 
 def _eval_linear_on_loader(
     model: PrototypePatchBackbone,
-    linear: nn.Module,
+    linear: Optional[nn.Module],
     loader: DataLoader,
     device: torch.device,
     num_classes: int,
     max_batches: Optional[int] = None,
 ) -> Dict[str, object]:
     criterion = nn.CrossEntropyLoss()
-    linear.eval()
+    if linear is not None:
+        linear.eval()
 
     total_loss = 0.0
     total_correct = 0
@@ -613,8 +614,14 @@ def _eval_linear_on_loader(
         for batch_idx, (images, labels) in enumerate(loader):
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
-            feat = model.extract_global_feature(images)
-            logits = linear(feat)
+            if linear is None:
+                out = model(images)
+                bsz = images.size(0)
+                num_patches = int(model.num_patches)
+                logits = out["logits"].view(bsz, num_patches, -1).mean(dim=1)
+            else:
+                feat = model.extract_global_feature(images)
+                logits = linear(feat)
             loss = criterion(logits, labels)
             preds = logits.argmax(dim=1)
 
@@ -828,7 +835,13 @@ class ContinualLightningModule(LightningModuleBase):
         return self.model(x)
 
     def training_step(self, batch, batch_idx: int):
-        images, labels = batch
+        if isinstance(batch, (tuple, list)) and len(batch) == 3:
+            images, labels, replay_flags = batch
+            replay_mask = replay_flags.to(device=images.device, non_blocking=True).bool()
+        else:
+            images, labels = batch
+            replay_mask = torch.zeros(labels.size(0), dtype=torch.bool, device=images.device)
+
         out = self.model(images)
         num_patches = self.model.num_patches
         labels_patch = labels.repeat_interleave(num_patches)
@@ -850,12 +863,18 @@ class ContinualLightningModule(LightningModuleBase):
         loss_ce = self.criterion_ce(logits_image, labels)
 
         loss_distill = torch.tensor(0.0, device=images.device)
-        if self.old_model is not None:
+        if self.old_model is not None and replay_mask.any():
             with torch.no_grad():
                 old_out = self.old_model(images)
+
+            logits_cur = out["logits"].view(images.size(0), num_patches, -1)
+            logits_old = old_out["logits"].view(images.size(0), num_patches, -1)
+            replay_logits_cur = logits_cur[replay_mask].reshape(-1, logits_cur.size(-1))
+            replay_logits_old = logits_old[replay_mask].reshape(-1, logits_old.size(-1))
+
             loss_distill = prd_loss(
-                logits_cur=out["logits"],
-                logits_old=old_out["logits"],
+                logits_cur=replay_logits_cur,
+                logits_old=replay_logits_old,
                 current_temp=self.args.current_temp,
                 past_temp=self.args.past_temp,
             )
@@ -1403,14 +1422,14 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--replay-size", type=int, default=500)
     parser.add_argument("--nce-temp", type=float, default=0.07)
-    parser.add_argument("--current-temp", type=float, default=0.10)
-    parser.add_argument("--past-temp", type=float, default=0.04)
+    parser.add_argument("--current-temp", type=float, default=1.0)
+    parser.add_argument("--past-temp", type=float, default=2.0)
 
     parser.add_argument("--lambda-patch-ce", type=float, default=1.0)
     parser.add_argument("--lambda-nce", type=float, default=1.0)
     parser.add_argument("--lambda-prd", "--lambda-pprd", dest="lambda_prd", type=float, default=1.0)
 
-    parser.add_argument("--linear-epochs", type=int, default=2)
+    parser.add_argument("--linear-epochs", type=int, default=50)
     parser.add_argument("--linear-lr", type=float, default=0.1)
     parser.add_argument("--log-dir", type=str, default="./logs")
     parser.add_argument("--run-name", type=str, default=None)

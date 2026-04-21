@@ -8,26 +8,45 @@ from torchvision import datasets, transforms
 
 
 class ReplayTensorDataset(Dataset):
-    """Replay dataset that mirrors CIFAR label type (Python int) for safe collation."""
+    """Replay dataset backed by source indices for on-the-fly augmentation."""
 
-    def __init__(self, images: torch.Tensor, labels: torch.Tensor) -> None:
-        self.images = images
-        self.labels = labels
+    def __init__(self, source_dataset: Dataset, indices: List[int], labels: List[int]) -> None:
+        self.source_dataset = source_dataset
+        self.indices = [int(idx) for idx in indices]
+        self.labels = torch.tensor([int(lbl) for lbl in labels], dtype=torch.long)
+        if len(self.indices) != int(self.labels.size(0)):
+            raise ValueError("indices and labels must have the same length")
 
     def __len__(self) -> int:
-        return self.images.size(0)
+        return len(self.indices)
 
     def __getitem__(self, idx: int):
-        return self.images[idx], int(self.labels[idx].item())
+        image, _ = self.source_dataset[self.indices[idx]]
+        return image, int(self.labels[idx].item())
+
+
+class DatasetWithReplayFlag(Dataset):
+    """Attach replay-source flag so training can gate distillation on replay only."""
+
+    def __init__(self, dataset: Dataset, is_replay: bool) -> None:
+        self.dataset = dataset
+        self.is_replay = 1 if is_replay else 0
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, idx: int):
+        image, label = self.dataset[idx]
+        return image, int(label), self.is_replay
 
 
 class ReplayBuffer:
-    """Simple class-aware replay buffer storing tensors on CPU."""
+    """Simple class-aware replay buffer storing source dataset indices."""
 
     def __init__(self, max_size: int, seed: int = 0) -> None:
         self.max_size = max_size
         self._rng = random.Random(seed)
-        self._storage: Dict[int, List[torch.Tensor]] = defaultdict(list)
+        self._storage: Dict[int, List[int]] = defaultdict(list)
 
     def __len__(self) -> int:
         return sum(len(v) for v in self._storage.values())
@@ -35,11 +54,11 @@ class ReplayBuffer:
     def is_empty(self) -> bool:
         return len(self) == 0
 
-    def add_samples(self, images: torch.Tensor, labels: torch.Tensor) -> None:
-        images = images.detach().cpu()
-        labels = labels.detach().cpu()
-        for img, lbl in zip(images, labels):
-            self._storage[int(lbl.item())].append(img)
+    def add_indices(self, indices: List[int], labels: List[int]) -> None:
+        if len(indices) != len(labels):
+            raise ValueError("indices and labels must have the same length")
+        for sample_idx, lbl in zip(indices, labels):
+            self._storage[int(lbl)].append(int(sample_idx))
         self._trim_balanced()
 
     def _trim_balanced(self) -> None:
@@ -47,54 +66,54 @@ class ReplayBuffer:
         if total <= self.max_size:
             return
 
-        classes = [c for c, imgs in self._storage.items() if len(imgs) > 0]
+        classes = [c for c, samples in self._storage.items() if len(samples) > 0]
         if not classes:
             return
 
         quota = max(1, self.max_size // len(classes))
-        new_storage: Dict[int, List[torch.Tensor]] = defaultdict(list)
+        new_storage: Dict[int, List[int]] = defaultdict(list)
 
         for cls in classes:
-            imgs = self._storage[cls]
-            if len(imgs) <= quota:
-                new_storage[cls] = imgs
+            samples = self._storage[cls]
+            if len(samples) <= quota:
+                new_storage[cls] = list(samples)
             else:
-                idx = list(range(len(imgs)))
+                idx = list(range(len(samples)))
                 self._rng.shuffle(idx)
-                new_storage[cls] = [imgs[i] for i in idx[:quota]]
+                new_storage[cls] = [samples[i] for i in idx[:quota]]
 
         # Fill leftover budget from remaining samples.
         used = sum(len(v) for v in new_storage.values())
         leftover = self.max_size - used
         if leftover > 0:
-            pool: List[Tuple[int, torch.Tensor]] = []
+            pool: List[Tuple[int, int]] = []
             for cls in classes:
-                chosen_ids = {id(x) for x in new_storage[cls]}
-                for img in self._storage[cls]:
-                    if id(img) not in chosen_ids:
-                        pool.append((cls, img))
+                chosen = set(new_storage[cls])
+                for sample_idx in self._storage[cls]:
+                    if sample_idx not in chosen:
+                        pool.append((cls, sample_idx))
             self._rng.shuffle(pool)
-            for cls, img in pool[:leftover]:
-                new_storage[cls].append(img)
+            for cls, sample_idx in pool[:leftover]:
+                new_storage[cls].append(sample_idx)
 
         self._storage = new_storage
 
-    def sample_dataset(self) -> Optional[Dataset]:
+    def sample_dataset(self, source_dataset: Dataset) -> Optional[Dataset]:
         if self.is_empty():
             return None
 
-        images = []
+        indices = []
         labels = []
-        for cls, imgs in self._storage.items():
-            for img in imgs:
-                images.append(img)
+        for cls, class_indices in self._storage.items():
+            for sample_idx in class_indices:
+                indices.append(sample_idx)
                 labels.append(cls)
 
-        idx = list(range(len(images)))
+        idx = list(range(len(indices)))
         self._rng.shuffle(idx)
-        image_tensor = torch.stack([images[i] for i in idx], dim=0)
-        label_tensor = torch.tensor([labels[i] for i in idx], dtype=torch.long)
-        return ReplayTensorDataset(image_tensor, label_tensor)
+        shuffled_indices = [indices[i] for i in idx]
+        shuffled_labels = [labels[i] for i in idx]
+        return ReplayTensorDataset(source_dataset, shuffled_indices, shuffled_labels)
 
 
 class SplitCIFAR10Manager:
@@ -230,12 +249,18 @@ class SplitCIFAR10Manager:
 
     def get_task_train_loader(self, task_id: int) -> DataLoader:
         current_subset = self._task_subset(self.train_dataset, task_id)
-        replay_dataset = self.replay_buffer.sample_dataset()
+        current_dataset: Dataset = DatasetWithReplayFlag(current_subset, is_replay=False)
+        replay_dataset = self.replay_buffer.sample_dataset(self.train_dataset)
 
         if replay_dataset is None:
-            train_dataset: Dataset = current_subset
+            train_dataset: Dataset = current_dataset
         else:
-            train_dataset = ConcatDataset([current_subset, replay_dataset])
+            train_dataset = ConcatDataset(
+                [
+                    current_dataset,
+                    DatasetWithReplayFlag(replay_dataset, is_replay=True),
+                ]
+            )
 
         return DataLoader(
             train_dataset,
@@ -288,7 +313,7 @@ class SplitCIFAR10Manager:
         )
 
     def update_replay_from_task(self, task_id: int, samples_per_class: Optional[int] = None) -> None:
-        dataset = self.train_dataset_eval
+        dataset = self.train_dataset
         indices = self.train_indices_by_task[task_id]
         if samples_per_class is None:
             seen_classes = (task_id + 1) * self.classes_per_task
@@ -305,15 +330,6 @@ class SplitCIFAR10Manager:
             rng.shuffle(cls_indices)
             chosen_indices.extend(cls_indices[:samples_per_class])
 
-        imgs = []
-        lbls = []
-        for idx in chosen_indices:
-            img, lbl = dataset[idx]
-            imgs.append(img)
-            lbls.append(lbl)
-
-        if imgs:
-            self.replay_buffer.add_samples(
-                torch.stack(imgs, dim=0),
-                torch.tensor(lbls, dtype=torch.long),
-            )
+        if chosen_indices:
+            chosen_labels = [int(targets[idx]) for idx in chosen_indices]
+            self.replay_buffer.add_indices(chosen_indices, chosen_labels)
