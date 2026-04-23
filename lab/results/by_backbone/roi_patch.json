@@ -1,6 +1,6 @@
 {
   "backbone": "roi_patch",
-  "run_name": "lab_roi_patch_class-position-ema_e2_le2_b128_r1000_s42",
+  "run_name": "lab_roi_patch_class-position-ema_e5_le5_b128_r1000_s42",
   "task_order": null,
   "task_classes": [
     [
@@ -24,16 +24,16 @@
       9
     ]
   ],
-  "summary_path": "/Users/pengu/Developer/pprd-refactor/logs/2026-04-21/lab_roi_patch_class-position-ema_e2_le2_b128_r1000_s42/results_summary.json",
-  "tasks_path": "/Users/pengu/Developer/pprd-refactor/logs/2026-04-21/lab_roi_patch_class-position-ema_e2_le2_b128_r1000_s42/results_tasks.json",
-  "step_eval_path": "/Users/pengu/Developer/pprd-refactor/logs/2026-04-21/lab_roi_patch_class-position-ema_e2_le2_b128_r1000_s42/results_step_eval.json",
-  "diagnostics_path": "/Users/pengu/Developer/pprd-refactor/logs/2026-04-21/lab_roi_patch_class-position-ema_e2_le2_b128_r1000_s42/results_diagnostics.json",
-  "combined_path": "/Users/pengu/Developer/pprd-refactor/logs/2026-04-21/lab_roi_patch_class-position-ema_e2_le2_b128_r1000_s42/results.json",
+  "summary_path": "/Users/pengu/Developer/pprd-refactor/logs/2026-04-22/lab_roi_patch_class-position-ema_e5_le5_b128_r1000_s42/results_summary.json",
+  "tasks_path": "/Users/pengu/Developer/pprd-refactor/logs/2026-04-22/lab_roi_patch_class-position-ema_e5_le5_b128_r1000_s42/results_tasks.json",
+  "step_eval_path": "/Users/pengu/Developer/pprd-refactor/logs/2026-04-22/lab_roi_patch_class-position-ema_e5_le5_b128_r1000_s42/results_step_eval.json",
+  "diagnostics_path": "/Users/pengu/Developer/pprd-refactor/logs/2026-04-22/lab_roi_patch_class-position-ema_e5_le5_b128_r1000_s42/results_diagnostics.json",
+  "combined_path": "/Users/pengu/Developer/pprd-refactor/logs/2026-04-22/lab_roi_patch_class-position-ema_e5_le5_b128_r1000_s42/results.json",
   "reused_existing": false,
   "checkpoint_recovered": false,
   "is_complete_task4": true,
   "eval_task_id": null,
-  "final_seen_avg_accuracy": 30.1,
-  "final_seen_avg_loss": 1.9152446699142456,
-  "final_mean_forgetting": 32.53
+  "final_seen_avg_accuracy": 34.65,
+  "final_seen_avg_loss": 1.7583579179763793,
+  "final_mean_forgetting": 36.61
 }
