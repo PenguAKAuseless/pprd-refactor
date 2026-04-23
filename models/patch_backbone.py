@@ -233,6 +233,7 @@ class PrototypePatchBackbone(nn.Module):
             else:
                 prev = self.prototype_codebook[class_id_int]
                 updated = self.codebook_momentum * prev + (1.0 - self.codebook_momentum) * class_proto
+                # Ensure the prototype remains on the unit hypersphere after EMA.
                 self.prototype_codebook[class_id_int] = F.normalize(updated, dim=-1)
             self.prototype_counts[class_id_int] += 1
 

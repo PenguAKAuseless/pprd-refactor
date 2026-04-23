@@ -863,18 +863,28 @@ class ContinualLightningModule(LightningModuleBase):
         loss_ce = self.criterion_ce(logits_image, labels)
 
         loss_distill = torch.tensor(0.0, device=images.device)
-        if self.old_model is not None and replay_mask.any():
+        # Apply PPRD distillation on the full batch (not only replay samples).
+        if self.old_model is not None:
             with torch.no_grad():
                 old_out = self.old_model(images)
 
-            logits_cur = out["logits"].view(images.size(0), num_patches, -1)
-            logits_old = old_out["logits"].view(images.size(0), num_patches, -1)
-            replay_logits_cur = logits_cur[replay_mask].reshape(-1, logits_cur.size(-1))
-            replay_logits_old = logits_old[replay_mask].reshape(-1, logits_old.size(-1))
+            # patch embeddings: [B, N, D]
+            patch_embeds_cur = out["proj"].view(images.size(0), num_patches, -1)
+            patch_embeds_old = old_out["proj"].view(images.size(0), num_patches, -1)
+
+            # active prototypes from both models: [K, D]
+            prototypes_cur = self.model.get_active_prototypes()
+            prototypes_old = self.old_model.get_active_prototypes()
+
+            # ensure prototypes are on the same device/dtype as embeddings
+            prototypes_cur = prototypes_cur.to(images.device, dtype=patch_embeds_cur.dtype)
+            prototypes_old = prototypes_old.to(images.device, dtype=patch_embeds_old.dtype)
 
             loss_distill = prd_loss(
-                logits_cur=replay_logits_cur,
-                logits_old=replay_logits_old,
+                patch_embeds_cur=patch_embeds_cur,
+                patch_embeds_old=patch_embeds_old,
+                prototypes_cur=prototypes_cur,
+                prototypes_old=prototypes_old,
                 current_temp=self.args.current_temp,
                 past_temp=self.args.past_temp,
             )

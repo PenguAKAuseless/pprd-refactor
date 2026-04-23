@@ -135,12 +135,41 @@ def pprd_loss(
 
 
 def prd_loss(
-    logits_cur: torch.Tensor,
-    logits_old: torch.Tensor,
+    patch_embeds_cur: torch.Tensor,
+    patch_embeds_old: torch.Tensor,
+    prototypes_cur: torch.Tensor,
+    prototypes_old: torch.Tensor,
     current_temp: float = 1.0,
     past_temp: float = 2.0,
+    patch_weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Predictive representation distillation on classifier logits."""
-    log_p_cur = F.log_softmax(logits_cur / current_temp, dim=-1)
-    p_old = F.softmax(logits_old / past_temp, dim=-1)
-    return F.kl_div(log_p_cur, p_old, reduction="batchmean")
+    """Patch-to-prototype relation distillation.
+
+    Args:
+        patch_embeds_cur: [B, N, D]
+        patch_embeds_old: [B, N, D]
+        prototypes_cur: [K, D]
+        prototypes_old: [K, D]
+    """
+    q_cur_logits = torch.einsum(
+        "bnd,kd->bnk",
+        F.normalize(patch_embeds_cur, dim=-1),
+        F.normalize(prototypes_cur, dim=-1),
+    )
+    q_old_logits = torch.einsum(
+        "bnd,kd->bnk",
+        F.normalize(patch_embeds_old, dim=-1),
+        F.normalize(prototypes_old, dim=-1),
+    )
+
+    log_q_cur = F.log_softmax(q_cur_logits / current_temp, dim=-1)
+    q_old = F.softmax(q_old_logits / past_temp, dim=-1)
+
+    per_patch_ce = -(q_old * log_q_cur).sum(dim=-1)  # [B, N]
+
+    if patch_weights is None:
+        return per_patch_ce.mean()
+
+    patch_weights = patch_weights.clamp_min(1e-6)
+    patch_weights = patch_weights / patch_weights.sum(dim=1, keepdim=True)
+    return (per_patch_ce * patch_weights).sum(dim=1).mean()
