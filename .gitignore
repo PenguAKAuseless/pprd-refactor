@@ -23,6 +23,7 @@ wandb/
 lightning_logs/
 checkpoints/
 *.pth
+lab/results/
 
 # Data archives
 datasets/*

@@ -190,7 +190,12 @@ class PrototypePatchBackbone(nn.Module):
             class_probs = probs.gather(1, patch_labels.view(-1, 1)).squeeze(1)
             patch_weights = class_probs.clamp_min(1e-6)
 
-        for class_id in patch_labels.unique().tolist():
+        # Only classes present in this batch are updated. Unseen classes are untouched.
+        present_classes = patch_labels.unique()
+        if present_classes.numel() == 0:
+            return
+
+        for class_id in present_classes.tolist():
             class_id_int = int(class_id)
             if class_id_int < 0 or class_id_int >= self.codebook_size:
                 continue

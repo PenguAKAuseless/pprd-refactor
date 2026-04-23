@@ -1152,6 +1152,7 @@ def run_training(args: argparse.Namespace) -> None:
     best_acc_by_task: Dict[int, float] = {}
     behavior_over_stages: List[Dict[str, object]] = []
     diagnostics_over_stages: List[Dict[str, object]] = []
+    teacher_model: Optional[PrototypePatchBackbone] = None
 
     for task_id in range(manager.tasks):
         model = model.to(device)
@@ -1161,12 +1162,7 @@ def run_training(args: argparse.Namespace) -> None:
             seen_task_id: manager.get_task_test_loader(seen_task_id, batch_size=args.batch_size)
             for seen_task_id in seen_tasks_for_stage
         }
-        old_model = None
-        if task_id > 0:
-            old_model = copy.deepcopy(model).to(device)
-            old_model.eval()
-            for p in old_model.parameters():
-                p.requires_grad = False
+        old_model = teacher_model
 
         train_loader = manager.get_task_train_loader(task_id)
 
@@ -1222,6 +1218,12 @@ def run_training(args: argparse.Namespace) -> None:
         log(f"Task {task_id} | Epochs: {args.epochs} | Avg Loss: {avg_loss:.4f}")
 
         manager.update_replay_from_task(task_id)
+
+        # Snapshot teacher only after the full task finishes.
+        teacher_model = copy.deepcopy(model).to(device)
+        teacher_model.eval()
+        for p in teacher_model.parameters():
+            p.requires_grad = False
 
         seen_tasks.append(task_id)
         seen_train_loader = manager.get_seen_train_loader(task_id, batch_size=args.batch_size)

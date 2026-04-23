@@ -1,6 +1,6 @@
 import random
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import torch
 from torch.utils.data import ConcatDataset, DataLoader, Dataset, Subset
@@ -61,6 +61,14 @@ class ReplayBuffer:
             self._storage[int(lbl)].append(int(sample_idx))
         self._trim_balanced()
 
+    def replace(self, class_to_indices: Dict[int, List[int]]) -> None:
+        new_storage: Dict[int, List[int]] = defaultdict(list)
+        for cls, indices in class_to_indices.items():
+            if not indices:
+                continue
+            new_storage[int(cls)] = [int(idx) for idx in indices]
+        self._storage = new_storage
+
     def _trim_balanced(self) -> None:
         total = len(self)
         if total <= self.max_size:
@@ -70,7 +78,10 @@ class ReplayBuffer:
         if not classes:
             return
 
-        quota = max(1, self.max_size // len(classes))
+        quota = self.max_size // len(classes)
+        if quota <= 0:
+            self._storage = defaultdict(list)
+            return
         new_storage: Dict[int, List[int]] = defaultdict(list)
 
         for cls in classes:
@@ -81,20 +92,6 @@ class ReplayBuffer:
                 idx = list(range(len(samples)))
                 self._rng.shuffle(idx)
                 new_storage[cls] = [samples[i] for i in idx[:quota]]
-
-        # Fill leftover budget from remaining samples.
-        used = sum(len(v) for v in new_storage.values())
-        leftover = self.max_size - used
-        if leftover > 0:
-            pool: List[Tuple[int, int]] = []
-            for cls in classes:
-                chosen = set(new_storage[cls])
-                for sample_idx in self._storage[cls]:
-                    if sample_idx not in chosen:
-                        pool.append((cls, sample_idx))
-            self._rng.shuffle(pool)
-            for cls, sample_idx in pool[:leftover]:
-                new_storage[cls].append(sample_idx)
 
         self._storage = new_storage
 
@@ -313,23 +310,40 @@ class SplitCIFAR10Manager:
         )
 
     def update_replay_from_task(self, task_id: int, samples_per_class: Optional[int] = None) -> None:
-        dataset = self.train_dataset
-        indices = self.train_indices_by_task[task_id]
+        seen_task_ids = list(range(task_id + 1))
+        seen_classes = sorted({int(cls) for t in seen_task_ids for cls in self.task_classes[t]})
+        if not seen_classes:
+            self.replay_buffer.replace({})
+            return
+
         if samples_per_class is None:
-            seen_classes = (task_id + 1) * self.classes_per_task
-            samples_per_class = max(1, self.replay_buffer.max_size // max(1, seen_classes))
+            samples_per_class = self.replay_buffer.max_size // len(seen_classes)
+        samples_per_class = int(samples_per_class)
+        if samples_per_class <= 0:
+            self.replay_buffer.replace({})
+            return
 
-        class_to_indices: Dict[int, List[int]] = defaultdict(list)
-        targets = self._dataset_targets(dataset)
-        for idx in indices:
-            class_to_indices[int(targets[idx])].append(idx)
+        targets = self._dataset_targets(self.train_dataset)
+        class_to_pool: Dict[int, List[int]] = {cls: [] for cls in seen_classes}
+        for seen_task_id in seen_task_ids:
+            for idx in self.train_indices_by_task[seen_task_id]:
+                cls = int(targets[idx])
+                if cls in class_to_pool:
+                    class_to_pool[cls].append(int(idx))
 
-        chosen_indices = []
-        rng = random.Random(self.seed + task_id)
-        for cls, cls_indices in class_to_indices.items():
-            rng.shuffle(cls_indices)
-            chosen_indices.extend(cls_indices[:samples_per_class])
+        rng = random.Random(self.seed + 10_000 + task_id)
+        balanced_selection: Dict[int, List[int]] = {}
+        for cls in seen_classes:
+            pool = class_to_pool.get(cls, [])
+            if not pool:
+                continue
+            candidates = list(pool)
+            rng.shuffle(candidates)
+            if len(candidates) >= samples_per_class:
+                balanced_selection[cls] = candidates[:samples_per_class]
+            else:
+                # Keep strict class counts even when a class pool is undersized.
+                extra = [rng.choice(candidates) for _ in range(samples_per_class - len(candidates))]
+                balanced_selection[cls] = candidates + extra
 
-        if chosen_indices:
-            chosen_labels = [int(targets[idx]) for idx in chosen_indices]
-            self.replay_buffer.add_indices(chosen_indices, chosen_labels)
+        self.replay_buffer.replace(balanced_selection)
