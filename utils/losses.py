@@ -121,7 +121,7 @@ def pprd_loss(
         F.normalize(prototypes_old, dim=-1),
     )
 
-    log_q_cur = F.log_softmax(q_cur_logits / current_temp, dim=-1)
+    log_q_cur = F.log_softmax(q_cur_logits / past_temp, dim=-1)
     q_old = F.softmax(q_old_logits / past_temp, dim=-1)
 
     per_patch_ce = -(q_old * log_q_cur).sum(dim=-1)  # [B, N]
