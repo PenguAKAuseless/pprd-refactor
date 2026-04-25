@@ -255,6 +255,32 @@ class PrototypePatchBackbone(nn.Module):
 
         return F.normalize(pos_proto.view(self.num_classes * self.num_patches, -1), dim=-1)
 
+    def get_active_prototypes_for_classes(self, class_ids) -> torch.Tensor:
+        """Return prototype rows restricted to the given class ids.
+
+        Class-level modes return [len(class_ids), D]. class_position_ema returns
+        [len(class_ids) * num_patches, D] with rows grouped per class.
+        """
+        proj_dim = self.prototype_codebook.size(-1)
+        device = self.prototype_codebook.device
+        sorted_ids = sorted({int(c) for c in class_ids if 0 <= int(c) < self.codebook_size})
+        if not sorted_ids:
+            return self.prototype_codebook.new_zeros((0, proj_dim))
+
+        idx = torch.tensor(sorted_ids, dtype=torch.long, device=device)
+
+        if self.patch_prototype_mode != "class_position_ema":
+            return self.prototype_codebook.index_select(0, idx)
+
+        pos_proto = self.prototype_pos_codebook.index_select(0, idx).clone()
+        pos_counts = self.prototype_pos_counts.index_select(0, idx)
+        class_proto = self.prototype_codebook.index_select(0, idx)
+        missing = pos_counts == 0
+        if missing.any():
+            pos_proto[missing] = class_proto.unsqueeze(1).expand_as(pos_proto)[missing]
+
+        return F.normalize(pos_proto.view(idx.size(0) * self.num_patches, -1), dim=-1)
+
 
 class SupConWrapper(PrototypePatchBackbone):
     """Backward-compatible name for patch mode."""

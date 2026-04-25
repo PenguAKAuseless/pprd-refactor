@@ -48,7 +48,7 @@ from utils.eval_diagnostics import (
     update_confusion_matrix,
 )
 from utils.litlogger import LitLogger
-from utils.losses import ISSupConLoss, prd_loss
+from utils.losses import ISSupConLoss, pprd_loss
 
 LightningModuleBase = pl.LightningModule if pl is not None else nn.Module
 
@@ -814,6 +814,8 @@ class ContinualLightningModule(LightningModuleBase):
         lit_logger: Optional[LitLogger] = None,
         stage_task_id: int = 0,
         step_offset: int = 0,
+        teacher_seen_classes: Optional[List[int]] = None,
+        teacher_ema_momentum: float = 0.999,
     ) -> None:
         super().__init__()
         self.model = model
@@ -824,6 +826,8 @@ class ContinualLightningModule(LightningModuleBase):
         self.lit_logger = lit_logger
         self.stage_task_id = stage_task_id
         self.step_offset = step_offset
+        self.teacher_seen_classes = sorted({int(c) for c in (teacher_seen_classes or [])})
+        self.teacher_ema_momentum = float(teacher_ema_momentum)
 
         self.criterion_nce = ISSupConLoss(temperature=args.nce_temp)
         self.criterion_ce = nn.CrossEntropyLoss()
@@ -863,29 +867,31 @@ class ContinualLightningModule(LightningModuleBase):
         loss_ce = self.criterion_ce(logits_image, labels)
 
         loss_distill = torch.tensor(0.0, device=images.device)
-        # Apply PPRD distillation on the full batch (not only replay samples).
-        if self.old_model is not None:
+        # PPRD distillation is restricted to replay samples (so the teacher only
+        # anchors classes it has actually observed) and to the teacher-seen
+        # prototype rows (to avoid poisoning the softmax with zero rows).
+        if (
+            self.old_model is not None
+            and self.teacher_seen_classes
+            and bool(replay_mask.any())
+        ):
             with torch.no_grad():
                 old_out = self.old_model(images)
 
-            # patch embeddings: [B, N, D]
-            patch_embeds_cur = out["proj"].view(images.size(0), num_patches, -1)
-            patch_embeds_old = old_out["proj"].view(images.size(0), num_patches, -1)
+            patch_embeds_cur = out["proj"].view(images.size(0), num_patches, -1)[replay_mask]
+            patch_embeds_old = old_out["proj"].view(images.size(0), num_patches, -1)[replay_mask]
 
-            # active prototypes from both models: [K, D]
-            prototypes_cur = self.model.get_active_prototypes()
-            prototypes_old = self.old_model.get_active_prototypes()
+            prototypes_cur = self.model.get_active_prototypes_for_classes(self.teacher_seen_classes)
+            prototypes_old = self.old_model.get_active_prototypes_for_classes(self.teacher_seen_classes)
 
-            # ensure prototypes are on the same device/dtype as embeddings
             prototypes_cur = prototypes_cur.to(images.device, dtype=patch_embeds_cur.dtype)
             prototypes_old = prototypes_old.to(images.device, dtype=patch_embeds_old.dtype)
 
-            loss_distill = prd_loss(
+            loss_distill = pprd_loss(
                 patch_embeds_cur=patch_embeds_cur,
                 patch_embeds_old=patch_embeds_old,
                 prototypes_cur=prototypes_cur,
                 prototypes_old=prototypes_old,
-                current_temp=self.args.current_temp,
                 past_temp=self.args.past_temp,
             )
 
@@ -1021,7 +1027,29 @@ class ContinualLightningModule(LightningModuleBase):
         if was_training:
             self.model.train()
 
+    @torch.no_grad()
+    def _update_teacher_ema(self) -> None:
+        if self.old_model is None:
+            return
+        m = self.teacher_ema_momentum
+        student_params = dict(self.model.named_parameters())
+        for name, teacher_p in self.old_model.named_parameters():
+            student_p = student_params.get(name)
+            if student_p is None:
+                continue
+            teacher_p.data.mul_(m).add_(student_p.data, alpha=1.0 - m)
+        student_buffers = dict(self.model.named_buffers())
+        for name, teacher_b in self.old_model.named_buffers():
+            student_b = student_buffers.get(name)
+            if student_b is None:
+                continue
+            if teacher_b.dtype.is_floating_point:
+                teacher_b.data.mul_(m).add_(student_b.data, alpha=1.0 - m)
+            else:
+                teacher_b.data.copy_(student_b.data)
+
     def on_train_batch_end(self, outputs, batch, batch_idx: int) -> None:
+        self._update_teacher_ema()
         step_eval_every = max(0, int(self.args.step_eval_every))
         if step_eval_every <= 0:
             return
@@ -1152,7 +1180,8 @@ def run_training(args: argparse.Namespace) -> None:
     best_acc_by_task: Dict[int, float] = {}
     behavior_over_stages: List[Dict[str, object]] = []
     diagnostics_over_stages: List[Dict[str, object]] = []
-    teacher_model: Optional[PrototypePatchBackbone] = None
+    teacher_ema_model: Optional[PrototypePatchBackbone] = None
+    teacher_seen_classes: List[int] = []
 
     for task_id in range(manager.tasks):
         model = model.to(device)
@@ -1162,7 +1191,10 @@ def run_training(args: argparse.Namespace) -> None:
             seen_task_id: manager.get_task_test_loader(seen_task_id, batch_size=args.batch_size)
             for seen_task_id in seen_tasks_for_stage
         }
-        old_model = teacher_model
+        if teacher_ema_model is not None:
+            teacher_ema_model = teacher_ema_model.to(device)
+            teacher_ema_model.eval()
+        old_model = teacher_ema_model
 
         train_loader = manager.get_task_train_loader(task_id)
 
@@ -1175,6 +1207,8 @@ def run_training(args: argparse.Namespace) -> None:
             lit_logger=lit_logger,
             stage_task_id=task_id,
             step_offset=step_offset,
+            teacher_seen_classes=list(teacher_seen_classes),
+            teacher_ema_momentum=args.teacher_ema_momentum,
         )
 
         callbacks = []
@@ -1219,11 +1253,25 @@ def run_training(args: argparse.Namespace) -> None:
 
         manager.update_replay_from_task(task_id)
 
-        # Snapshot teacher only after the full task finishes.
-        teacher_model = copy.deepcopy(model).to(device)
-        teacher_model.eval()
-        for p in teacher_model.parameters():
-            p.requires_grad = False
+        # Initialize the parameter-EMA teacher at the end of the first stage.
+        # Subsequent stages inherit and keep advancing the same object in-place
+        # via ContinualLightningModule._update_teacher_ema during training.
+        if teacher_ema_model is None:
+            teacher_ema_model = copy.deepcopy(model).to(device)
+            teacher_ema_model.eval()
+            for p in teacher_ema_model.parameters():
+                p.requires_grad = False
+        else:
+            teacher_ema_model = teacher_ema_model.to(device)
+            teacher_ema_model.eval()
+
+        # Record the classes now represented in the teacher so future stages
+        # distill over them (A+B masking keys off this set).
+        for cls in manager.task_classes[task_id]:
+            cls_int = int(cls)
+            if cls_int not in teacher_seen_classes:
+                teacher_seen_classes.append(cls_int)
+        teacher_seen_classes.sort()
 
         seen_tasks.append(task_id)
         seen_train_loader = manager.get_seen_train_loader(task_id, batch_size=args.batch_size)
@@ -1440,6 +1488,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda-patch-ce", type=float, default=1.0)
     parser.add_argument("--lambda-nce", type=float, default=1.0)
     parser.add_argument("--lambda-prd", "--lambda-pprd", dest="lambda_prd", type=float, default=1.0)
+    parser.add_argument(
+        "--teacher-ema-momentum",
+        type=float,
+        default=0.999,
+        help=(
+            "EMA momentum for the parameter-EMA PPRD teacher. Higher values slow "
+            "teacher drift and retain longer memory of early tasks."
+        ),
+    )
 
     parser.add_argument("--linear-epochs", type=int, default=50)
     parser.add_argument("--linear-lr", type=float, default=0.1)

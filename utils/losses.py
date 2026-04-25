@@ -98,11 +98,13 @@ def pprd_loss(
     patch_embeds_old: torch.Tensor,
     prototypes_cur: torch.Tensor,
     prototypes_old: torch.Tensor,
-    current_temp: float = 0.1,
     past_temp: float = 0.04,
     patch_weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Patch-to-prototype relation distillation.
+    """Patch-to-prototype relation distillation (PPRD).
+
+    Applies past_temp symmetrically to student and teacher prototype-relation
+    logits, then cross-entropy-matches the softmax distributions per patch.
 
     Args:
         patch_embeds_cur: [B, N, D]

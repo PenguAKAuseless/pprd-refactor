@@ -31,3 +31,6 @@ datasets/*
 # Notebook and editor
 .ipynb_checkpoints/
 .vscode/
+
+# Misc
+CLAUDE.md
