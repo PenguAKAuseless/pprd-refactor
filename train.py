@@ -48,7 +48,7 @@ from utils.eval_diagnostics import (
     update_confusion_matrix,
 )
 from utils.litlogger import LitLogger
-from utils.losses import ISSupConLoss, pprd_loss
+from utils.losses import ISSupConLoss, ird_loss, pprd_loss
 
 LightningModuleBase = pl.LightningModule if pl is not None else nn.Module
 
@@ -867,6 +867,8 @@ class ContinualLightningModule(LightningModuleBase):
         loss_ce = self.criterion_ce(logits_image, labels)
 
         loss_distill = torch.tensor(0.0, device=images.device)
+        loss_ird = torch.tensor(0.0, device=images.device)
+        old_out: Optional[Dict[str, torch.Tensor]] = None
         # PPRD distillation is restricted to replay samples (so the teacher only
         # anchors classes it has actually observed) and to the teacher-seen
         # prototype rows (to avoid poisoning the softmax with zero rows).
@@ -895,6 +897,20 @@ class ContinualLightningModule(LightningModuleBase):
                 past_temp=self.args.past_temp,
             )
 
+        # IRD regularizes encoder drift by aligning the within-batch instance
+        # similarity structure to the teacher. Applies to the full batch
+        # (current + replay) since it operates on the encoder geometry directly,
+        # not on prototype rows that may be uninitialized for unseen classes.
+        if self.old_model is not None and self.args.lambda_ird > 0.0:
+            if old_out is None:
+                with torch.no_grad():
+                    old_out = self.old_model(images)
+            loss_ird = ird_loss(
+                embeds_cur=out["proj_image"],
+                embeds_old=old_out["proj_image"],
+                temperature=self.args.ird_temp,
+            )
+
         self.model.update_codebook(
             out["proj"],
             labels_patch,
@@ -906,6 +922,7 @@ class ContinualLightningModule(LightningModuleBase):
             self.args.lambda_nce * loss_nce
             + self.args.lambda_patch_ce * loss_ce
             + self.args.lambda_prd * loss_distill
+            + self.args.lambda_ird * loss_ird
         )
 
         self.log("train/loss", total_loss, on_step=True, on_epoch=True, prog_bar=True)
@@ -913,6 +930,7 @@ class ContinualLightningModule(LightningModuleBase):
         self.log("train/loss_ce", loss_ce, on_step=True, on_epoch=True)
         self.log("train/loss_prd", loss_distill, on_step=True, on_epoch=True)
         self.log("train/loss_pprd", loss_distill, on_step=True, on_epoch=True)
+        self.log("train/loss_ird", loss_ird, on_step=True, on_epoch=True)
         return total_loss
 
     def _eval_current_model_on_loader(
@@ -1488,6 +1506,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda-patch-ce", type=float, default=1.0)
     parser.add_argument("--lambda-nce", type=float, default=1.0)
     parser.add_argument("--lambda-prd", "--lambda-pprd", dest="lambda_prd", type=float, default=1.0)
+    parser.add_argument(
+        "--lambda-ird",
+        type=float,
+        default=1.0,
+        help="Weight on instance-relation distillation (CO2L-style).",
+    )
+    parser.add_argument(
+        "--ird-temp",
+        type=float,
+        default=0.2,
+        help="Symmetric softmax temperature for IRD pairwise-similarity rows.",
+    )
     parser.add_argument(
         "--teacher-ema-momentum",
         type=float,

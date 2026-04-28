@@ -136,6 +136,52 @@ def pprd_loss(
     return (per_patch_ce * patch_weights).sum(dim=1).mean()
 
 
+def ird_loss(
+    embeds_cur: torch.Tensor,
+    embeds_old: torch.Tensor,
+    temperature: float = 0.2,
+) -> torch.Tensor:
+    """Instance-Relation Distillation (CO2L-style).
+
+    Distills the within-batch instance similarity structure from teacher to
+    student. Each row of the [B, B] cosine-similarity matrix (with self-pairs
+    masked out) is read as a probability distribution; cross-entropy aligns the
+    student's row to the teacher's, regularizing encoder drift.
+
+    Args:
+        embeds_cur: [B, D] student instance embeddings.
+        embeds_old: [B, D] teacher instance embeddings.
+        temperature: softmax temperature applied symmetrically to both rows.
+    """
+    if embeds_cur.dim() != 2 or embeds_old.dim() != 2:
+        raise ValueError("embeds must be [B, D]")
+    if embeds_cur.size(0) != embeds_old.size(0):
+        raise ValueError("embeds_cur and embeds_old must share the same batch size")
+    if embeds_cur.size(0) < 2:
+        return embeds_cur.new_zeros(())
+
+    z_cur = F.normalize(embeds_cur, dim=-1)
+    z_old = F.normalize(embeds_old, dim=-1)
+
+    sim_cur = torch.matmul(z_cur, z_cur.t()) / temperature
+    sim_old = torch.matmul(z_old, z_old.t()) / temperature
+
+    bsz = z_cur.size(0)
+    self_mask = torch.eye(bsz, device=z_cur.device, dtype=torch.bool)
+    sim_cur = sim_cur.masked_fill(self_mask, float("-inf"))
+    sim_old = sim_old.masked_fill(self_mask, float("-inf"))
+
+    log_p_cur = F.log_softmax(sim_cur, dim=-1)
+    p_old = F.softmax(sim_old, dim=-1)
+
+    # log_softmax produces -inf on the masked diagonal; zero both factors there
+    # so the cross-entropy avoids 0 * -inf -> NaN while preserving off-diag terms.
+    p_old = p_old.masked_fill(self_mask, 0.0)
+    log_p_cur = log_p_cur.masked_fill(self_mask, 0.0)
+
+    return -(p_old * log_p_cur).sum(dim=-1).mean()
+
+
 def prd_loss(
     patch_embeds_cur: torch.Tensor,
     patch_embeds_old: torch.Tensor,
