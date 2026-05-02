@@ -79,6 +79,7 @@ New arguments:
 
 - `--patch-prototype-mode {class_mean_ema,class_confidence_ema,class_position_ema}`
 - `--patch-proto-sharpness <float>` (used in `class_confidence_ema`)
+- `--patch-mode {normal,roi}` (preferred; `--backbone` remains for legacy scripts)
 
 Training integration:
 
@@ -94,7 +95,7 @@ Use:
 
 ```bash
 python lab/run_patch_prototype_comparison.py \
-  --backbone patch \
+  --patch-mode normal \
   --epochs 3 --linear-epochs 3 \
   --batch-size 128 --replay-size 1000
 ```
@@ -103,7 +104,7 @@ Fast smoke run:
 
 ```bash
 python lab/run_patch_prototype_comparison.py \
-  --backbone patch \
+  --patch-mode normal \
   --epochs 1 --linear-epochs 1 \
   --batch-size 64 --replay-size 200 \
   --max-train-batches 1 --max-eval-batches 1 --max-step-eval-batches 1 --step-eval-every 0

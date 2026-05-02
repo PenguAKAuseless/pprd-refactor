@@ -1,28 +1,26 @@
-# PPRD: Patch-Based Continual Learning with Contrastive Distillation
+# PPRD: Patch-Based Prototype Relation Distillation for Continual Learning
 
-This repository provides a Split CIFAR-10 continual learning pipeline based on patch-level representations, replay, and PRD distillation.
+This repository implements a research-grade Split CIFAR-10 continual learning pipeline built on patch-level representations, replay, and prototype relation distillation. The codebase is organized into modular building blocks (encoders, patch extractors, heads, and codebooks) and produces standardized artifacts for reproducible analysis.
 
-Core features:
+## Highlights
 
-- Tensor-only 2x2 patch extraction and bilinear upsampling
-- ResNet18 encoder + MLP projection head
-- ISSupConLoss for contrastive supervision
-- PRD logit distillation from the frozen previous model
-- Patch prototype modes: class_mean_ema, class_confidence_ema, class_position_ema
-- Unified backbone modes: patch and roi_patch
-- Structured artifacts for downstream analysis, including stage diagnostics
+- Modular, lego-block model assembly via `models/builder.py`
+- Patch and ROI patch extractors with shared code paths
+- ETF classifier and configurable prototype codebooks (EMA or fixed)
+- Replay buffer and importance-scaled supervised contrastive loss
+- Standardized output artifacts for task-eval and step-eval analysis
+- WandB sweep support for loss balancing
 
-## 1) Repository Layout
+## Repository Layout
 
-- train.py: main entrypoint for continual training and eval-only checkpoint analysis
-- data/: split manager and replay buffer logic
-- models/: patch/roi_patch backbone implementation
-- utils/: losses, logging, and evaluation diagnostics utilities
-- lab/: comparison runners and analysis notebook
-- tests/: unit tests for diagnostics and replay behavior
-- logs/: experiment outputs (generated)
+- `train.py`: main entrypoint for continual training and eval-only analysis
+- `data/`: split manager and replay buffer logic
+- `models/`: encoders, extractors, heads, and model builder
+- `utils/`: losses, logging, and evaluation diagnostics
+- `lab/`: ablation runners and analysis notebooks
+- `logs/`: experiment outputs (generated)
 
-## 2) Environment Setup
+## Environment Setup
 
 Option A (pip):
 
@@ -40,87 +38,84 @@ conda env create -f environment.yml
 conda activate pprd
 ```
 
-## 3) Dev Tooling
-
-Install development tools:
+Dev tooling:
 
 ```bash
 pip install -r requirements-dev.txt
-```
-
-Run checks:
-
-```bash
-ruff check train.py data models utils lab tests
-ruff format --check train.py data models utils lab tests
+ruff check train.py data models utils lab
+ruff format --check train.py data models utils lab
 pytest
 ```
 
-Enable pre-commit hooks:
-
-```bash
-pre-commit install
-```
-
-## 4) Quick Start
+## Quick Start
 
 Smoke test:
 
 ```bash
-python train.py --epochs 1 --linear-epochs 1 --batch-size 64 --num-workers 0 --max-train-batches 1 --max-eval-batches 1 --device auto --enable-csv
+python train.py --epochs 1 --linear-epochs 1 --batch-size 64 --num-workers 0 \
+  --max-train-batches 1 --max-eval-batches 1 --device cpu
 ```
 
-Backbone comparison:
+Standard continual run (normal patches + EMA mean codebook):
 
 ```bash
-python lab/run_backbone_comparison.py --backbones patch roi_patch --epochs 2 --linear-epochs 2 --batch-size 128 --replay-size 1000 --device auto
+python train.py --patch-mode normal --codebook-mode ema_mean \
+  --epochs 10 --batch-size 128 --replay-size 500
 ```
 
-Patch prototype comparison:
+ROI patches with confidence-weighted prototypes:
 
 ```bash
-python lab/run_patch_prototype_comparison.py --backbone patch --epochs 3 --linear-epochs 3
+python train.py --patch-mode roi --patch-prototype-mode class_confidence_ema \
+  --epochs 10 --batch-size 128 --replay-size 500
 ```
 
-## 5) Device Backends
+## Ablation Script
 
-- --device auto: CUDA > MPS > CPU
-- --device cuda: strict CUDA check
-- --device mps: strict Apple Metal check
-- --device cpu: force CPU
+`run_ablation.sh` executes the three target configurations with unique run directories. You can override defaults via environment variables:
 
-## 6) Run Artifacts
+```bash
+EPOCHS=2 LINEAR_EPOCHS=2 BATCH_SIZE=128 REPLAY_SIZE=500 DEVICE=auto ./run_ablation.sh
+```
+
+## Analysis Notebook
+
+Use `lab/analysis.ipynb` for post-hoc analysis only. It includes `fetch_latest_experiment()` to locate the most recent run matching a configuration and utilities for Average Accuracy (AA) and Backward Transfer (BWT).
+
+Important separation:
+
+- Task-eval (linear probe after each stage) lives in `results_tasks.json`.
+- Step-eval (raw logits during training) lives in `results_step_eval.json`.
+
+## Run Artifacts
 
 Each run directory contains:
 
-- training.log: human-readable training timeline
-- events.jsonl: structured events from LitLogger
-- metrics.csv: scalar metrics from LitLogger
-- results_tasks.json: per-stage linear-eval metrics over seen tasks
-- results_step_eval.json: step-level raw-logit evaluation snapshots
-- results_summary.json: final aggregate summary
-- results_diagnostics.json: stage-level confusion diagnostics and failure flags
-- results.json: combined artifact for compatibility
+- `training.log`: training timeline
+- `events.jsonl`: structured events from LitLogger
+- `metrics.csv`: scalar metric time series
+- `results_tasks.json`: per-stage task-eval metrics plus a uniform `task_eval` row
+- `results_step_eval.json`: step-level raw-logit snapshots
+- `results_summary.json`: final aggregate metrics (includes `final_avg_accuracy`)
+- `results_diagnostics.json`: confusion diagnostics and failure flags
+- `results.json`: combined artifact for compatibility
+- `model_task_{N}.pth`, `model_final.pth`: checkpoints
+- `args.json`: CLI arguments used for the run
 
-Important note:
+## WandB Sweeps
 
-- results_step_eval.json and results_tasks.json are different measurement modes.
-- Step-eval uses raw model logits during training.
-- Stage summary uses linear-probe evaluation on frozen features.
+A Bayesian sweep configuration is provided in `sweep.yaml`. Example usage:
 
-## 7) Notebook Analysis
+```bash
+wandb sweep sweep.yaml
+wandb agent <entity>/<project>/<sweep_id>
+```
 
-Use lab/backbone_comparison.ipynb to:
+The sweep metric is logged as `sweep/avg_accuracy` (Average Accuracy over all tasks at the final stage).
 
-- compare final per-task performance
-- inspect all-task behavior across training stages (heatmap + trajectories)
-- deep-dive near-chance failures using confusion diagnostics
+## Device Backends
 
-If diagnostics are missing in existing runs, rerun the training/comparison scripts after updating train.py.
-
-## 8) CI
-
-GitHub Actions workflow is defined in .github/workflows/ci.yml and runs:
-
-- Ruff lint/format checks
-- Pytest suite
+- `--device auto`: CUDA > MPS > CPU
+- `--device cuda`: strict CUDA check
+- `--device mps`: strict Apple Metal check
+- `--device cpu`: force CPU

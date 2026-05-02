@@ -1,0 +1,38 @@
+program: train.py
+method: bayes
+metric:
+  name: sweep/avg_accuracy
+  goal: maximize
+parameters:
+  "lambda-nce":
+    distribution: uniform
+    min: 0.1
+    max: 2.0
+  "lambda-patch-ce":
+    distribution: uniform
+    min: 0.1
+    max: 2.0
+  "lambda-prd":
+    distribution: uniform
+    min: 0.1
+    max: 2.0
+  "epochs":
+    value: 2
+  "linear-epochs":
+    value: 2
+  "batch-size":
+    value: 128
+  "replay-size":
+    value: 500
+  "patch-mode":
+    value: normal
+  "codebook-mode":
+    value: ema_mean
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - --use-wandb
+  - --wandb-project
+  - pprd
+  - ${args}

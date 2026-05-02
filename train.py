@@ -41,6 +41,7 @@ except Exception:
     load_dotenv = None
 
 from data.datasets import SplitCIFAR10Manager
+from models.builder import build_patch_model
 from models.patch_backbone import PrototypePatchBackbone
 from utils.eval_diagnostics import (
     init_confusion_matrix,
@@ -104,30 +105,42 @@ def _build_run_name_and_id(args: argparse.Namespace) -> Tuple[str, str]:
     if args.run_name:
         run_name = args.run_name
     else:
+        patch_label = _resolve_patch_mode(args)
+        codebook_label = args.codebook_mode if getattr(args, "codebook_mode", None) else "ema"
         run_name = (
-            f"splitcifar10_{args.backbone}_e{args.epochs}_le{args.linear_epochs}"
+            f"splitcifar10_{patch_label}_{codebook_label}_e{args.epochs}_le{args.linear_epochs}"
             f"_b{args.batch_size}_r{args.replay_size}_s{args.seed}_{stamp}"
         )
-    run_id = args.run_id if args.run_id else hashlib.sha1(run_name.encode("utf-8")).hexdigest()[:12]
+    if args.run_id:
+        run_id = args.run_id
+    else:
+        run_id = hashlib.sha1(f"{run_name}_{stamp}".encode("utf-8")).hexdigest()[:12]
     return run_name, run_id
 
 
-def _make_run_dir(args: argparse.Namespace, run_name: str) -> Path:
+def _make_run_dir(args: argparse.Namespace, run_name: str, run_id: str) -> Path:
     base = Path(args.log_dir)
     base.mkdir(parents=True, exist_ok=True)
     date_dir = base / datetime.now().strftime("%Y-%m-%d")
     date_dir.mkdir(parents=True, exist_ok=True)
     run_dir = date_dir / run_name
-    run_dir.mkdir(parents=True, exist_ok=True)
+    if run_dir.exists():
+        candidate = f"{run_name}_{run_id}"
+        run_dir = date_dir / candidate
+        counter = 1
+        while run_dir.exists():
+            run_dir = date_dir / f"{candidate}_{counter}"
+            counter += 1
+    run_dir.mkdir(parents=True, exist_ok=False)
     return run_dir
 
 
-def _resolve_run_dir_for_eval(args: argparse.Namespace, run_name: str) -> Path:
+def _resolve_run_dir_for_eval(args: argparse.Namespace, run_name: str, run_id: str) -> Path:
     if args.eval_run_dir:
         run_dir = Path(args.eval_run_dir).expanduser().resolve()
         run_dir.mkdir(parents=True, exist_ok=True)
         return run_dir
-    return _make_run_dir(args, run_name)
+    return _make_run_dir(args, run_name, run_id)
 
 
 def _save_run_artifacts(args: argparse.Namespace, run_dir: Path, model: nn.Module) -> None:
@@ -249,7 +262,9 @@ def evaluate_checkpoint(args: argparse.Namespace) -> None:
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
     run_name, run_id = _build_run_name_and_id(args)
-    run_dir = _resolve_run_dir_for_eval(args, run_name)
+    run_dir = _resolve_run_dir_for_eval(args, run_name, run_id)
+    run_name = run_dir.name
+    args.run_name = run_name
 
     total_tasks = 5
     task_order = _parse_task_order(args.task_order, total_tasks)
@@ -374,6 +389,7 @@ def evaluate_checkpoint(args: argparse.Namespace) -> None:
         "seen_avg_accuracy": seen_avg_accuracy,
         "mean_forgetting": mean_forgetting,
         "problematic_tasks": stage_diagnostics["problematic_tasks"],
+        "task_eval": _build_task_eval_row(manager.tasks, per_task_eval, seen_tasks),
         "seen_task_metrics": per_task_eval,
         "eval_only": True,
         "checkpoint_path": str(checkpoint_path),
@@ -390,6 +406,13 @@ def evaluate_checkpoint(args: argparse.Namespace) -> None:
         by_stage[stage_id] = row
     by_stage[eval_task_id] = stage_result
     tasks_out = [by_stage[stage_id] for stage_id in sorted(by_stage.keys())]
+    for row in tasks_out:
+        if "task_eval" in row:
+            continue
+        per_task = row.get("seen_task_metrics")
+        seen = row.get("seen_tasks", [])
+        if isinstance(per_task, list):
+            row["task_eval"] = _build_task_eval_row(manager.tasks, per_task, seen)
 
     behavior_over_stages: List[Dict[str, object]] = []
     for row in tasks_out:
@@ -430,10 +453,12 @@ def evaluate_checkpoint(args: argparse.Namespace) -> None:
         diagnostics_by_stage[stage_id] for stage_id in sorted(diagnostics_by_stage.keys())
     ]
 
+    final_avg_accuracy = _compute_avg_accuracy(stage_result["task_eval"])
     summary_payload = {
         "run": {"name": run_name, "id": run_id},
         "task_classes": manager.task_classes,
         "final_seen_avg_accuracy": seen_avg_accuracy,
+        "final_avg_accuracy": final_avg_accuracy,
         "final_seen_avg_loss": seen_avg_loss,
         "final_mean_forgetting": mean_forgetting,
         "diagnostics_artifact": "results_diagnostics.json",
@@ -462,6 +487,7 @@ def evaluate_checkpoint(args: argparse.Namespace) -> None:
                 "tasks": tasks_out,
                 "summary": {
                     "final_seen_avg_accuracy": seen_avg_accuracy,
+                    "final_avg_accuracy": final_avg_accuracy,
                     "final_seen_avg_loss": seen_avg_loss,
                     "final_mean_forgetting": mean_forgetting,
                     "diagnostics_artifact": "results_diagnostics.json",
@@ -524,21 +550,47 @@ def _resolve_precision(precision: str):
     return precision
 
 
+def _resolve_patch_mode(args: argparse.Namespace) -> str:
+    patch_mode = getattr(args, "patch_mode", None)
+    if patch_mode:
+        return patch_mode
+    backbone = getattr(args, "backbone", "patch")
+    return "roi" if backbone == "roi_patch" else "normal"
+
+
+def _resolve_codebook_mode(args: argparse.Namespace) -> Tuple[str, str]:
+    mode = getattr(args, "codebook_mode", None)
+    if mode is None:
+        return "ema", args.patch_prototype_mode
+    if mode == "ema_mean":
+        return "ema", "class_mean_ema"
+    if mode == "fixed":
+        return "fixed", args.patch_prototype_mode
+    raise ValueError(f"Unsupported codebook_mode: {mode}")
+
+
 def _build_model(args: argparse.Namespace, device: torch.device) -> nn.Module:
-    common = dict(
+    patch_mode = _resolve_patch_mode(args)
+    codebook_mode, patch_proto_mode = _resolve_codebook_mode(args)
+    args.patch_mode = patch_mode
+    args.patch_prototype_mode = patch_proto_mode
+    model = build_patch_model(
         num_classes=10,
         img_size=32,
         proj_dim=args.proj_dim,
+        mlp_hidden_dim=args.mlp_hidden_dim,
+        patch_mode=patch_mode,
+        codebook_mode=codebook_mode,
+        patch_prototype_mode=patch_proto_mode,
         codebook_size=args.codebook_size,
-        codebook_momentum=args.prototype_momentum,
-        patch_prototype_mode=args.patch_prototype_mode,
+        prototype_momentum=args.prototype_momentum,
         patch_proto_sharpness=args.patch_proto_sharpness,
-        backbone_mode=args.backbone,
         roi_min_scale=args.roi_min_scale,
         roi_max_scale=args.roi_max_scale,
         roi_prob=args.roi_prob,
+        classifier_type="etf",
     )
-    return PrototypePatchBackbone(**common).to(device)
+    return model.to(device)
 
 
 def train_linear_eval(
@@ -788,6 +840,52 @@ def _build_stage_diagnostics(
         "problematic_tasks": problematic_tasks,
         "per_task": per_task_payload,
     }
+
+
+def _build_task_eval_row(
+    total_tasks: int,
+    per_task_eval: List[Dict[str, float]],
+    seen_tasks: List[int],
+) -> List[Dict[str, object]]:
+    metrics_by_task: Dict[int, Dict[str, float]] = {
+        int(metric["task_id"]): metric for metric in per_task_eval
+    }
+    seen_set = {int(task_id) for task_id in seen_tasks}
+    row: List[Dict[str, object]] = []
+    for task_id in range(total_tasks):
+        metric = metrics_by_task.get(task_id)
+        if metric is not None:
+            row.append(
+                {
+                    "task_id": task_id,
+                    "loss": float(metric["loss"]),
+                    "accuracy": float(metric["accuracy"]),
+                    "forgetting": float(metric["forgetting"]),
+                    "seen": True,
+                }
+            )
+        else:
+            row.append(
+                {
+                    "task_id": task_id,
+                    "loss": None,
+                    "accuracy": None,
+                    "forgetting": None,
+                    "seen": task_id in seen_set,
+                }
+            )
+    return row
+
+
+def _compute_avg_accuracy(task_eval_row: List[Dict[str, object]]) -> float:
+    accs = [
+        float(item["accuracy"])
+        for item in task_eval_row
+        if item.get("accuracy") is not None
+    ]
+    if not accs:
+        return 0.0
+    return float(sum(accs) / len(accs))
 
 
 def _format_behavior_line(current_task: int, per_task_eval: List[Dict[str, float]]) -> str:
@@ -1159,7 +1257,9 @@ def run_training(args: argparse.Namespace) -> None:
     model = _build_model(args, device)
 
     run_name, run_id = _build_run_name_and_id(args)
-    run_dir = _make_run_dir(args, run_name)
+    run_dir = _make_run_dir(args, run_name, run_id)
+    run_name = run_dir.name
+    args.run_name = run_name
     _save_run_artifacts(args, run_dir, model)
     lit_logger = LitLogger(run_dir=run_dir)
     all_loggers = _build_loggers(args, run_dir, run_name=run_name, run_id=run_id)
@@ -1377,8 +1477,10 @@ def run_training(args: argparse.Namespace) -> None:
             "seen_avg_accuracy": seen_avg_accuracy,
             "mean_forgetting": mean_forgetting,
             "problematic_tasks": stage_diagnostics["problematic_tasks"],
+            "task_eval": _build_task_eval_row(manager.tasks, per_task_eval, seen_tasks),
             "seen_task_metrics": per_task_eval,
         }
+        avg_accuracy = _compute_avg_accuracy(task_result["task_eval"])
         task_results.append(task_result)
 
         lit_logger.log_metrics(
@@ -1387,6 +1489,7 @@ def run_training(args: argparse.Namespace) -> None:
                 "task/avg_train_loss": avg_loss,
                 "task/seen_avg_loss": seen_avg_loss,
                 "task/seen_avg_accuracy": seen_avg_accuracy,
+                "task/avg_accuracy": avg_accuracy,
                 "task/mean_forgetting": mean_forgetting,
             },
         )
@@ -1407,6 +1510,7 @@ def run_training(args: argparse.Namespace) -> None:
                     "task/avg_train_loss": avg_loss,
                     "task/seen_avg_loss": seen_avg_loss,
                     "task/seen_avg_accuracy": seen_avg_accuracy,
+                    "task/avg_accuracy": avg_accuracy,
                     "task/mean_forgetting": mean_forgetting,
                     "task/id": task_id,
                 }
@@ -1424,6 +1528,7 @@ def run_training(args: argparse.Namespace) -> None:
                     "tasks": task_results,
                     "summary": {
                         "final_seen_avg_accuracy": seen_avg_accuracy,
+                        "final_avg_accuracy": avg_accuracy,
                         "final_seen_avg_loss": seen_avg_loss,
                         "final_mean_forgetting": mean_forgetting,
                         "diagnostics_artifact": "results_diagnostics.json",
@@ -1448,6 +1553,7 @@ def run_training(args: argparse.Namespace) -> None:
                     "run": {"name": run_name, "id": run_id},
                     "task_classes": manager.task_classes,
                     "final_seen_avg_accuracy": seen_avg_accuracy,
+                    "final_avg_accuracy": avg_accuracy,
                     "final_seen_avg_loss": seen_avg_loss,
                     "final_mean_forgetting": mean_forgetting,
                     "diagnostics_artifact": "results_diagnostics.json",
@@ -1461,6 +1567,13 @@ def run_training(args: argparse.Namespace) -> None:
 
     torch.save(model.state_dict(), run_dir / "model_final.pth")
     log("Continual training completed.")
+
+    final_avg_accuracy = (
+        _compute_avg_accuracy(task_results[-1]["task_eval"]) if task_results else 0.0
+    )
+    for logger in all_loggers:
+        if isinstance(logger, WandbLogger):
+            logger.log_metrics({"sweep/avg_accuracy": final_avg_accuracy})
 
     for logger in all_loggers:
         if isinstance(logger, WandbLogger) and hasattr(logger, "experiment"):
@@ -1484,6 +1597,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=5e-4)
 
     parser.add_argument("--proj-dim", type=int, default=128)
+    parser.add_argument("--mlp-hidden-dim", type=int, default=512)
     parser.add_argument("--codebook-size", type=int, default=64)
     parser.add_argument("--prototype-momentum", type=float, default=0.9)
     parser.add_argument(
@@ -1493,6 +1607,20 @@ def parse_args() -> argparse.Namespace:
         default="class_mean_ema",
     )
     parser.add_argument("--patch-proto-sharpness", type=float, default=1.0)
+    parser.add_argument(
+        "--patch-mode",
+        type=str,
+        choices=["normal", "roi"],
+        default=None,
+        help="Patch extraction mode. If unset, falls back to --backbone.",
+    )
+    parser.add_argument(
+        "--codebook-mode",
+        type=str,
+        choices=["fixed", "ema_mean"],
+        default=None,
+        help="Codebook mode. ema_mean forces class_mean_ema prototypes.",
+    )
     parser.add_argument("--backbone", type=str, choices=["patch", "roi_patch"], default="patch")
     parser.add_argument("--roi-min-scale", type=float, default=0.55)
     parser.add_argument("--roi-max-scale", type=float, default=1.0)
