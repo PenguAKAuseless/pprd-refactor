@@ -670,7 +670,7 @@ def _eval_linear_on_loader(
                 out = model(images)
                 bsz = images.size(0)
                 num_patches = int(model.num_patches)
-                logits = out["logits"].view(bsz, num_patches, -1).mean(dim=1)
+                logits = out["logits"].reshape(bsz, num_patches, -1).mean(dim=1)
             else:
                 feat = model.extract_global_feature(images)
                 logits = linear(feat)
@@ -707,32 +707,38 @@ def linear_eval_seen_tasks(
     epochs: int = 3,
     lr: float = 0.1,
     max_batches: Optional[int] = None,
+    use_linear_probe: bool = False,
     return_diagnostics: bool = False,
 ) -> Dict[str, object]:
-    """Train one linear probe on seen train data, then report per-task test metrics."""
+    """Evaluate seen tasks using the model head (optionally via a linear probe)."""
     model = model.to(device)
     model.eval()
-    linear = nn.Linear(model.head[-1].out_features, num_classes).to(device)
-    optimizer = optim.SGD(linear.parameters(), lr=lr, momentum=0.9, weight_decay=0.0)
-    criterion = nn.CrossEntropyLoss()
+    linear: Optional[nn.Module] = None
+    if use_linear_probe:
+        linear = nn.Linear(model.head[-1].out_features, num_classes).to(device)
+        optimizer = optim.SGD(linear.parameters(), lr=lr, momentum=0.9, weight_decay=0.0)
+        criterion = nn.CrossEntropyLoss()
 
-    for _ in range(epochs):
-        linear.train()
-        for batch_idx, (images, labels) in enumerate(seen_train_loader):
-            images = images.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
+        for _ in range(epochs):
+            linear.train()
+            for batch_idx, (images, labels) in enumerate(seen_train_loader):
+                images = images.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
 
-            with torch.no_grad():
-                feat = model.extract_global_feature(images)
+                with torch.no_grad():
+                    feat = model.extract_global_feature(images)
 
-            logits = linear(feat)
-            loss = criterion(logits, labels)
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
+                logits = linear(feat)
+                loss = criterion(logits, labels)
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                optimizer.step()
 
-            if max_batches is not None and batch_idx + 1 >= max_batches:
-                break
+                if max_batches is not None and batch_idx + 1 >= max_batches:
+                    break
+    else:
+        # Prototype/ETF evaluation uses the model directly; no probe training needed.
+        _ = seen_train_loader
 
     per_task_metrics: List[Dict[str, float]] = []
     per_task_diagnostics: List[Dict[str, object]] = []
@@ -932,6 +938,14 @@ class ContinualLightningModule(LightningModuleBase):
         self.latest_epoch_loss = 0.0
         self.best_step_acc_by_task: Dict[int, float] = {}
         self.step_eval_records: List[Dict[str, float]] = []
+        self._enforce_old_model_eval()
+
+    def _enforce_old_model_eval(self) -> None:
+        if self.old_model is None:
+            return
+        self.old_model.eval()
+        for param in self.old_model.parameters():
+            param.requires_grad = False
 
     def forward(self, x: torch.Tensor):
         return self.model(x)
@@ -945,11 +959,21 @@ class ContinualLightningModule(LightningModuleBase):
             replay_mask = torch.zeros(labels.size(0), dtype=torch.bool, device=images.device)
 
         out = self.model(images)
-        num_patches = self.model.num_patches
+        num_patches = int(self.model.num_patches)
+        batch_size = labels.size(0)
         labels_patch = labels.repeat_interleave(num_patches)
-        patch_indices = torch.arange(num_patches, device=images.device).repeat(images.size(0))
+        patch_indices = torch.arange(num_patches, device=images.device).repeat(batch_size)
 
-        importance_weight = torch.ones_like(labels_patch, dtype=torch.float, device=images.device)
+        # Balance replay vs. current samples so smaller replay subsets keep influence.
+        num_replay = int(replay_mask.sum().item())
+        num_current = batch_size - num_replay
+        per_image_weight = torch.ones(batch_size, dtype=torch.float, device=images.device)
+        if num_replay > 0 and num_current > 0:
+            current_weight = batch_size / (2.0 * num_current)
+            replay_weight = batch_size / (2.0 * num_replay)
+            per_image_weight[~replay_mask] = current_weight
+            per_image_weight[replay_mask] = replay_weight
+        importance_weight = per_image_weight.repeat_interleave(num_patches)
         index = torch.arange(labels_patch.size(0), device=images.device)
         score_mask = torch.ones_like(labels_patch, dtype=torch.bool, device=images.device)
 
@@ -961,7 +985,7 @@ class ContinualLightningModule(LightningModuleBase):
             score_mask=score_mask,
         )
 
-        logits_image = out["logits"].view(images.size(0), num_patches, -1).mean(dim=1)
+        logits_image = out["logits"].reshape(images.size(0), num_patches, -1).mean(dim=1)
         loss_ce = self.criterion_ce(logits_image, labels)
 
         loss_distill = torch.tensor(0.0, device=images.device)
@@ -978,8 +1002,8 @@ class ContinualLightningModule(LightningModuleBase):
             with torch.no_grad():
                 old_out = self.old_model(images)
 
-            patch_embeds_cur = out["proj"].view(images.size(0), num_patches, -1)[replay_mask]
-            patch_embeds_old = old_out["proj"].view(images.size(0), num_patches, -1)[replay_mask]
+            patch_embeds_cur = out["proj"].reshape(images.size(0), num_patches, -1)[replay_mask]
+            patch_embeds_old = old_out["proj"].reshape(images.size(0), num_patches, -1)[replay_mask]
 
             prototypes_cur = self.model.get_active_prototypes_for_classes(self.teacher_seen_classes)
             prototypes_old = self.old_model.get_active_prototypes_for_classes(self.teacher_seen_classes)
@@ -1046,7 +1070,9 @@ class ContinualLightningModule(LightningModuleBase):
                 images = images.to(self.device, non_blocking=True)
                 labels = labels.to(self.device, non_blocking=True)
                 out = self.model(images)
-                logits_image = out["logits"].view(images.size(0), self.model.num_patches, -1).mean(dim=1)
+                logits_image = out["logits"].reshape(
+                    images.size(0), int(self.model.num_patches), -1
+                ).mean(dim=1)
                 loss = criterion(logits_image, labels)
                 total_loss += float(loss.item()) * int(labels.size(0))
                 total_correct += int((logits_image.argmax(dim=1) == labels).sum().item())
@@ -1145,27 +1171,13 @@ class ContinualLightningModule(LightningModuleBase):
 
     @torch.no_grad()
     def _update_teacher_ema(self) -> None:
-        if self.old_model is None:
-            return
-        m = self.teacher_ema_momentum
-        student_params = dict(self.model.named_parameters())
-        for name, teacher_p in self.old_model.named_parameters():
-            student_p = student_params.get(name)
-            if student_p is None:
-                continue
-            teacher_p.data.mul_(m).add_(student_p.data, alpha=1.0 - m)
-        student_buffers = dict(self.model.named_buffers())
-        for name, teacher_b in self.old_model.named_buffers():
-            student_b = student_buffers.get(name)
-            if student_b is None:
-                continue
-            if teacher_b.dtype.is_floating_point:
-                teacher_b.data.mul_(m).add_(student_b.data, alpha=1.0 - m)
-            else:
-                teacher_b.data.copy_(student_b.data)
+        # Teacher snapshots are frozen; EMA updates are intentionally disabled.
+        return
+
+    def on_train_batch_start(self, batch, batch_idx: int, dataloader_idx: int = 0) -> None:
+        self._enforce_old_model_eval()
 
     def on_train_batch_end(self, outputs, batch, batch_idx: int) -> None:
-        self._update_teacher_ema()
         step_eval_every = max(0, int(self.args.step_eval_every))
         if step_eval_every <= 0:
             return
@@ -1312,6 +1324,8 @@ def run_training(args: argparse.Namespace) -> None:
         if teacher_ema_model is not None:
             teacher_ema_model = teacher_ema_model.to(device)
             teacher_ema_model.eval()
+            for param in teacher_ema_model.parameters():
+                param.requires_grad = False
         old_model = teacher_ema_model
 
         train_loader = manager.get_task_train_loader(task_id)
@@ -1371,17 +1385,11 @@ def run_training(args: argparse.Namespace) -> None:
 
         manager.update_replay_from_task(task_id)
 
-        # Initialize the parameter-EMA teacher at the end of the first stage.
-        # Subsequent stages inherit and keep advancing the same object in-place
-        # via ContinualLightningModule._update_teacher_ema during training.
-        if teacher_ema_model is None:
-            teacher_ema_model = copy.deepcopy(model).to(device)
-            teacher_ema_model.eval()
-            for p in teacher_ema_model.parameters():
-                p.requires_grad = False
-        else:
-            teacher_ema_model = teacher_ema_model.to(device)
-            teacher_ema_model.eval()
+        # Snapshot the just-finished task as a frozen teacher for the next stage.
+        teacher_ema_model = copy.deepcopy(model).to(device)
+        teacher_ema_model.eval()
+        for p in teacher_ema_model.parameters():
+            p.requires_grad = False
 
         # Record the classes now represented in the teacher so future stages
         # distill over them (A+B masking keys off this set).

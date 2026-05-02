@@ -104,7 +104,7 @@ def pprd_loss(
     """Patch-to-prototype relation distillation (PPRD).
 
     Applies past_temp symmetrically to student and teacher prototype-relation
-    logits, then cross-entropy-matches the softmax distributions per patch.
+    logits, then KL-matches the softmax distributions per patch.
 
     Args:
         patch_embeds_cur: [B, N, D]
@@ -126,14 +126,15 @@ def pprd_loss(
     log_q_cur = F.log_softmax(q_cur_logits / past_temp, dim=-1)
     q_old = F.softmax(q_old_logits / past_temp, dim=-1)
 
-    per_patch_ce = -(q_old * log_q_cur).sum(dim=-1)  # [B, N]
+    # KL(q_old || q_cur): compare soft teacher distribution against student log-probs.
+    per_patch_kl = F.kl_div(log_q_cur, q_old, reduction="none").sum(dim=-1)  # [B, N]
 
     if patch_weights is None:
-        return per_patch_ce.mean()
+        return per_patch_kl.mean()
 
     patch_weights = patch_weights.clamp_min(1e-6)
     patch_weights = patch_weights / patch_weights.sum(dim=1, keepdim=True)
-    return (per_patch_ce * patch_weights).sum(dim=1).mean()
+    return (per_patch_kl * patch_weights).sum(dim=1).mean()
 
 
 def ird_loss(

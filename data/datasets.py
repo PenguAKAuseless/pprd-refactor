@@ -323,13 +323,19 @@ class SplitCIFAR10Manager:
             self.replay_buffer.replace({})
             return
 
+        # Strict CL: only use current-task data directly; past data must come from replay buffer.
         targets = self._dataset_targets(self.train_dataset)
         class_to_pool: Dict[int, List[int]] = {cls: [] for cls in seen_classes}
-        for seen_task_id in seen_task_ids:
-            for idx in self.train_indices_by_task[seen_task_id]:
-                cls = int(targets[idx])
-                if cls in class_to_pool:
-                    class_to_pool[cls].append(int(idx))
+        current_task_classes = {int(cls) for cls in self.task_classes[task_id]}
+        for idx in self.train_indices_by_task[task_id]:
+            cls = int(targets[idx])
+            if cls in class_to_pool:
+                class_to_pool[cls].append(int(idx))
+
+        for cls, stored_indices in self.replay_buffer._storage.items():
+            cls_int = int(cls)
+            if cls_int in class_to_pool and cls_int not in current_task_classes:
+                class_to_pool[cls_int].extend(int(i) for i in stored_indices)
 
         rng = random.Random(self.seed + 10_000 + task_id)
         balanced_selection: Dict[int, List[int]] = {}
