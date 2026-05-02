@@ -1,5 +1,8 @@
 program: train.py
 method: bayes
+early_terminate:
+  type: hyperband
+  min_iter: 2
 metric:
   name: sweep/avg_accuracy
   goal: maximize

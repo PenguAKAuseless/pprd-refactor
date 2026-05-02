@@ -919,6 +919,7 @@ class ContinualLightningModule(LightningModuleBase):
         stage_task_id: int = 0,
         step_offset: int = 0,
         teacher_seen_classes: Optional[List[int]] = None,
+        current_task_classes: Optional[List[int]] = None,
         teacher_ema_momentum: float = 0.999,
     ) -> None:
         super().__init__()
@@ -931,13 +932,33 @@ class ContinualLightningModule(LightningModuleBase):
         self.stage_task_id = stage_task_id
         self.step_offset = step_offset
         self.teacher_seen_classes = sorted({int(c) for c in (teacher_seen_classes or [])})
+        self.current_task_classes = sorted({int(c) for c in (current_task_classes or [])})
         self.teacher_ema_momentum = float(teacher_ema_momentum)
 
+        # Active classes: every class the student is allowed to predict at this
+        # stage (past via replay + current task). Logits at non-active classes
+        # are pushed to a large negative value before CE so softmax does not
+        # actively repel features from never-seen ETF vertices.
+        # Masking only kicks in once there are past classes to protect; at
+        # stage 0 (teacher_seen_classes empty) the unmasked CE is needed to
+        # actively align features with the seen ETF vertices, otherwise the
+        # 2-way softmax leaves features free to drift toward unseen vertices
+        # and eval-time argmax over all 10 ETF vectors collapses.
+        num_classes = int(self.model.num_classes)
+        if self.teacher_seen_classes:
+            active_classes = sorted(set(self.teacher_seen_classes) | set(self.current_task_classes))
+            active_logit_bias = torch.full((num_classes,), -1e4)
+            active_logit_bias[active_classes] = 0.0
+        else:
+            active_logit_bias = torch.zeros(num_classes)
+        self.register_buffer("active_logit_bias", active_logit_bias, persistent=False)
+
         self.criterion_nce = ISSupConLoss(temperature=args.nce_temp)
-        self.criterion_ce = nn.CrossEntropyLoss()
+        self.criterion_ce = nn.CrossEntropyLoss(reduction="none")
         self.latest_epoch_loss = 0.0
         self.best_step_acc_by_task: Dict[int, float] = {}
         self.step_eval_records: List[Dict[str, float]] = []
+        # Pin teacher state immediately; train() override keeps it pinned thereafter.
         self._enforce_old_model_eval()
 
     def _enforce_old_model_eval(self) -> None:
@@ -946,6 +967,14 @@ class ContinualLightningModule(LightningModuleBase):
         self.old_model.eval()
         for param in self.old_model.parameters():
             param.requires_grad = False
+
+    def train(self, mode: bool = True):
+        # Lightning recursively flips children to train mode at epoch starts and
+        # after validation. Override to keep the frozen teacher in eval so its
+        # BatchNorm running stats stay pinned to the past-task snapshot.
+        super().train(mode)
+        self._enforce_old_model_eval()
+        return self
 
     def forward(self, x: torch.Tensor):
         return self.model(x)
@@ -986,7 +1015,15 @@ class ContinualLightningModule(LightningModuleBase):
         )
 
         logits_image = out["logits"].reshape(images.size(0), num_patches, -1).mean(dim=1)
-        loss_ce = self.criterion_ce(logits_image, labels)
+        # Theory 2: mask logits to active classes (past via replay + current
+        # task) so CE softmax does not actively repel features from never-seen
+        # ETF vertices. Theory 1: weight per-sample CE by replay/current
+        # balance so the few replay samples are not drowned out by current-task
+        # majority. The bias is all-zeros when there are no past classes yet
+        # (stage 0); see __init__ for the rationale.
+        masked_logits = logits_image + self.active_logit_bias  # broadcasts over batch
+        per_sample_ce = self.criterion_ce(masked_logits, labels)  # (B,)
+        loss_ce = (per_sample_ce * per_image_weight).mean()
 
         loss_distill = torch.tensor(0.0, device=images.device)
         loss_ird = torch.tensor(0.0, device=images.device)
@@ -1088,8 +1125,8 @@ class ContinualLightningModule(LightningModuleBase):
         if not self.seen_tasks or not self.seen_test_loaders:
             return
 
-        was_training = self.model.training
-        self.model.eval()
+        was_training = self.training
+        self.eval()  # via override: teacher stays in eval too
 
         per_task = []
         weighted_loss = 0.0
@@ -1167,15 +1204,12 @@ class ContinualLightningModule(LightningModuleBase):
                 )
 
         if was_training:
-            self.model.train()
+            self.train()  # via override: re-enters training; teacher stays in eval
 
     @torch.no_grad()
     def _update_teacher_ema(self) -> None:
         # Teacher snapshots are frozen; EMA updates are intentionally disabled.
         return
-
-    def on_train_batch_start(self, batch, batch_idx: int, dataloader_idx: int = 0) -> None:
-        self._enforce_old_model_eval()
 
     def on_train_batch_end(self, outputs, batch, batch_idx: int) -> None:
         step_eval_every = max(0, int(self.args.step_eval_every))
@@ -1340,6 +1374,7 @@ def run_training(args: argparse.Namespace) -> None:
             stage_task_id=task_id,
             step_offset=step_offset,
             teacher_seen_classes=list(teacher_seen_classes),
+            current_task_classes=[int(c) for c in manager.task_classes[task_id]],
             teacher_ema_momentum=args.teacher_ema_momentum,
         )
 
